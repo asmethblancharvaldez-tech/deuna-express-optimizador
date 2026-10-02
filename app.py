@@ -51,16 +51,80 @@ def osrm_matrix(coords):
 def route_load(route, demands):
     return sum(demands[i] for i in route if i != 0)
 
+def can_pack_loads(loads, capacities):
+    """Comprueba si las cargas pueden distribuirse en la flota disponible."""
+    loads = sorted([int(x) for x in loads if x > 0], reverse=True)
+    remaining = sorted([int(c) for c in capacities], reverse=True)
+    if sum(loads) > sum(remaining):
+        return False
+    if loads and loads[0] > max(remaining):
+        return False
+
+    def backtrack(pos):
+        if pos == len(loads):
+            return True
+        load = loads[pos]
+        tried = set()
+        for b in range(len(remaining)):
+            if remaining[b] in tried or remaining[b] < load:
+                continue
+            tried.add(remaining[b])
+            remaining[b] -= load
+            if backtrack(pos + 1):
+                return True
+            remaining[b] += load
+        return False
+
+    return backtrack(0)
+
+
+def assign_routes_to_bikes(routes, demands, capacities):
+    """Asigna una ruta por motocicleta, buscando el mejor ajuste de capacidad."""
+    route_info = sorted(
+        [(r, route_load(r, demands)) for r in routes],
+        key=lambda x: x[1], reverse=True
+    )
+    bikes = [(k + 1, int(c)) for k, c in enumerate(capacities)]
+    best = None
+
+    def search(pos, used, current):
+        nonlocal best
+        if pos == len(route_info):
+            best = list(current)
+            return True
+        route, load = route_info[pos]
+        options = sorted(
+            [(k, c) for k, c in bikes if k not in used and c >= load],
+            key=lambda x: (x[1] - load, x[1])
+        )
+        for k, c in options:
+            used.add(k)
+            current.append({"moto": k, "capacidad": c, "ruta": route, "carga": load})
+            if search(pos + 1, used, current):
+                return True
+            current.pop()
+            used.remove(k)
+        return False
+
+    search(0, set(), [])
+    return best
+
+
 def clarke_wright(dist, demands, capacities):
     """
-    Clarke & Wright paralelo para CVRP.
-    0 = depósito; 1..n = clientes.
-    Se crean rutas unitarias y se fusionan por ahorro descendente,
-    respetando la capacidad máxima disponible.
+    Clarke & Wright paralelo para CVRP con flota de capacidades diferentes.
+    Las fusiones consideran no solo la capacidad máxima, sino también si las
+    cargas resultantes siguen siendo compatibles con la capacidad total de la flota.
     """
     n = len(demands) - 1
     routes = [[i] for i in range(1, n + 1)]
     max_capacity = max(capacities)
+
+    # Validaciones de factibilidad básicas.
+    if any(demands[i] > max_capacity for i in range(1, n + 1)):
+        return [], [( [i], demands[i]) for i in range(1, n + 1) if demands[i] > max_capacity]
+    if not can_pack_loads([demands[i] for i in range(1, n + 1)], capacities):
+        return [], [(list(range(1, n + 1)), sum(demands[1:]))]
 
     savings = []
     for i in range(1, n + 1):
@@ -75,49 +139,122 @@ def clarke_wright(dist, demands, capacities):
                 return idx
         return None
 
-    for _, i, j in savings:
-        ri, rj = locate(i), locate(j)
-        if ri is None or rj is None or ri == rj:
-            continue
-        a, b = routes[ri], routes[rj]
-        if i not in (a[0], a[-1]) or j not in (b[0], b[-1]):
-            continue
-        if route_load(a, demands) + route_load(b, demands) > max_capacity:
-            continue
+    # Recorremos repetidamente los ahorros porque una fusión puede habilitar otras.
+    changed = True
+    while changed and len(routes) > len(capacities):
+        changed = False
+        for _, i, j in savings:
+            ri, rj = locate(i), locate(j)
+            if ri is None or rj is None or ri == rj:
+                continue
+            a, b = routes[ri], routes[rj]
+            if i not in (a[0], a[-1]) or j not in (b[0], b[-1]):
+                continue
+            merged_load = route_load(a, demands) + route_load(b, demands)
+            if merged_load > max_capacity:
+                continue
 
-        candidates = []
-        if a[-1] == i and b[0] == j:
-            candidates.append(a + b)
-        if a[0] == i and b[-1] == j:
-            candidates.append(b + a)
-        if a[0] == i and b[0] == j:
-            candidates.append(list(reversed(a)) + b)
-        if a[-1] == i and b[-1] == j:
-            candidates.append(a + list(reversed(b)))
-        if not candidates:
+            candidates = []
+            if a[-1] == i and b[0] == j:
+                candidates.append(a + b)
+            if a[0] == i and b[-1] == j:
+                candidates.append(b + a)
+            if a[0] == i and b[0] == j:
+                candidates.append(list(reversed(a)) + b)
+            if a[-1] == i and b[-1] == j:
+                candidates.append(a + list(reversed(b)))
+            if not candidates:
+                continue
+
+            # Verifica que las cargas actuales sigan pudiendo acomodarse en la flota.
+            other_routes = [r for idx, r in enumerate(routes) if idx not in (ri, rj)]
+            prospective_loads = [route_load(r, demands) for r in other_routes] + [merged_load]
+            if not can_pack_loads(prospective_loads, capacities):
+                continue
+
+            merged = candidates[0]
+            for idx in sorted([ri, rj], reverse=True):
+                routes.pop(idx)
+            routes.append(merged)
+            changed = True
+            break
+
+    # Si ya hay como máximo una ruta por moto, busca una asignación exacta ruta-moto.
+    if len(routes) <= len(capacities):
+        assigned = assign_routes_to_bikes(routes, demands, capacities)
+        if assigned is not None:
+            return assigned, []
+
+    # Si el ahorro puro quedó atrapado, reconstruye una solución factible por capacidad:
+    # asigna clientes a motos y aplica Clarke & Wright dentro de cada grupo.
+    customers = sorted(range(1, n + 1), key=lambda i: demands[i], reverse=True)
+    remaining = [int(c) for c in capacities]
+    groups = [[] for _ in capacities]
+    for customer in customers:
+        q = demands[customer]
+        feasible = [k for k, rem in enumerate(remaining) if rem >= q]
+        if not feasible:
+            return [], [( [customer], q)]
+        # Mejor ajuste: deja el menor espacio libre posible.
+        k = min(feasible, key=lambda x: remaining[x] - q)
+        groups[k].append(customer)
+        remaining[k] -= q
+
+    assigned = []
+    for k, group in enumerate(groups):
+        if not group:
             continue
+        # Clarke & Wright dentro de los clientes ya asignados a esta motocicleta.
+        local_routes = [[i] for i in group]
+        local_savings = [(dist[0][i] + dist[0][j] - dist[i][j], i, j)
+                         for pos, i in enumerate(group) for j in group[pos+1:]]
+        local_savings.sort(reverse=True)
+        for _, i, j in local_savings:
+            ri = next((idx for idx, r in enumerate(local_routes) if i in r), None)
+            rj = next((idx for idx, r in enumerate(local_routes) if j in r), None)
+            if ri is None or rj is None or ri == rj:
+                continue
+            a, b = local_routes[ri], local_routes[rj]
+            if i not in (a[0], a[-1]) or j not in (b[0], b[-1]):
+                continue
+            candidates = []
+            if a[-1] == i and b[0] == j: candidates.append(a + b)
+            if a[0] == i and b[-1] == j: candidates.append(b + a)
+            if a[0] == i and b[0] == j: candidates.append(list(reversed(a)) + b)
+            if a[-1] == i and b[-1] == j: candidates.append(a + list(reversed(b)))
+            if candidates:
+                merged = candidates[0]
+                for idx in sorted([ri, rj], reverse=True):
+                    local_routes.pop(idx)
+                local_routes.append(merged)
+        # Une las subrutas restantes del mismo grupo por sus extremos más cercanos.
+        while len(local_routes) > 1:
+            best = None
+            for a_idx in range(len(local_routes)):
+                for b_idx in range(a_idx + 1, len(local_routes)):
+                    a, b = local_routes[a_idx], local_routes[b_idx]
+                    variants = [
+                        (dist[a[-1]][b[0]], a + b),
+                        (dist[a[-1]][b[-1]], a + list(reversed(b))),
+                        (dist[a[0]][b[0]], list(reversed(a)) + b),
+                        (dist[a[0]][b[-1]], b + a),
+                    ]
+                    cand = min(variants, key=lambda x: x[0])
+                    if best is None or cand[0] < best[0]:
+                        best = (cand[0], a_idx, b_idx, cand[1])
+            _, a_idx, b_idx, merged = best
+            for idx in sorted([a_idx, b_idx], reverse=True):
+                local_routes.pop(idx)
+            local_routes.append(merged)
 
-        merged = candidates[0]
-        for idx in sorted([ri, rj], reverse=True):
-            routes.pop(idx)
-        routes.append(merged)
-
-    # Asignación de rutas a motos por capacidad.
-    route_info = [(r, route_load(r, demands)) for r in routes]
-    route_info.sort(key=lambda x: x[1], reverse=True)
-    bikes = sorted([(c, k + 1) for k, c in enumerate(capacities)], reverse=True)
-
-    assigned, unassigned = [], []
-    used = set()
-    for route, load in route_info:
-        options = [(c, k) for c, k in bikes if k not in used and c >= load]
-        if not options:
-            unassigned.append((route, load))
-            continue
-        c, k = min(options, key=lambda x: x[0])
-        used.add(k)
-        assigned.append({"moto": k, "capacidad": c, "ruta": route, "carga": load})
-    return assigned, unassigned
+        route = local_routes[0]
+        assigned.append({
+            "moto": k + 1,
+            "capacidad": int(capacities[k]),
+            "ruta": route,
+            "carga": route_load(route, demands)
+        })
+    return assigned, []
 
 def route_metrics(route, dist, dur):
     seq = [0] + route + [0]
@@ -240,8 +377,9 @@ if st.button("🚀 Generar rutas optimizadas", type="primary", use_container_wid
 
     if unassigned:
         st.warning(
-            "La heurística no pudo asignar todas las rutas a la flota con las "
-            "capacidades indicadas. Revise las capacidades o aumente el número de motos."
+            "No fue posible construir una solución factible con las demandas y capacidades "
+            "ingresadas. Verifique que ningún pedido supere la capacidad máxima de una moto "
+            "y que la capacidad total de la flota sea suficiente."
         )
 
     st.success(f"Rutas generadas para {batch} – {bloque}")
@@ -256,8 +394,11 @@ if st.button("🚀 Generar rutas optimizadas", type="primary", use_container_wid
         customer_names = []
         for node in item["ruta"]:
             row = clean.iloc[node - 1]
-            name = str(row["Cliente"]).strip()
-            customer_names.append(name if name else str(row["Pedido"]))
+            raw_name = row["Cliente"]
+            raw_order = row["Pedido"]
+            name = "" if pd.isna(raw_name) or str(raw_name).strip().lower() in ("", "none", "nan") else str(raw_name).strip()
+            order_id = f"P{node:03d}" if pd.isna(raw_order) or str(raw_order).strip().lower() in ("", "none", "nan") else str(raw_order).strip()
+            customer_names.append(name if name else order_id)
 
         st.markdown(f"### 🛵 Moto {item['moto']}")
         st.write("**Secuencia:** Depósito → " + " → ".join(customer_names) + " → Depósito")
